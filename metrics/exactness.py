@@ -1,9 +1,27 @@
 import torch
 
 from chebgate.core.fp32 import fp32_reference_mode
-from chebgate.core.state_dict import strip_orig_mod_prefix, load_state_dict_portable
+from chebgate.core.state_dict import strip_orig_mod_prefix, load_state_dict_portable, _unwrap_compiled
 from chebgate.model.net import ChebResNet
+from chebgate.model.chebconv import ChebConv2d
 
+
+@torch.no_grad()
+def layer_exactness_check(model, device, batch: int = 8, H: int = 32, W: int = 32):
+    """
+    Layer-level strict FP32 reference equivalence check.
+    """
+    core = _unwrap_compiled(model)
+    first_cheb = None
+    for m in core.modules():
+        if isinstance(m, ChebConv2d):
+            first_cheb = m
+            break
+    if first_cheb is None:
+        return None
+
+    x = torch.randn(batch, first_cheb.Cin, H, W, device=device, dtype=torch.float32)
+    return first_cheb.exactness_check(x)
 
 @torch.no_grad()
 def network_exactness_check(state_dict, model_cfg, device):
