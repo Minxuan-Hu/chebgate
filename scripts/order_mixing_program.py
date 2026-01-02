@@ -14,20 +14,20 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from matplotlib.transforms import Bbox
 
 import torchvision
 import torchvision.transforms as T
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 import sklearn
 from sklearn.cluster import KMeans
 from sklearn.metrics import normalized_mutual_info_score
 
 from chebgate.model import ChebResNet, ChebConv2d
+
 
 # -------------------------
 # Determinism / strictness
@@ -52,6 +52,7 @@ plt.rcParams.update({
 COL_BASE = "C1"   # orange-ish
 COL_SWAP = "C2"   # green-ish
 COL_AUX  = "C0"   # blue-ish (diag)
+
 
 # -------------------------
 # Checkpoint helpers
@@ -120,7 +121,7 @@ def expand_stage3_layers(spec: str, depth_stage3: int):
 
 
 # -------------------------
-# Dataset with global index + deterministic loading
+# Dataset with local index (0..len-1)
 # -------------------------
 class IndexedDataset(Dataset):
     def __init__(self, base_ds):
@@ -135,23 +136,46 @@ def _seed_worker(worker_id: int):
     seed = torch.initial_seed() % (2**32)
     np.random.seed(seed)
 
-def build_test_loader(data_root="./data", batch_size=128, num_workers=4, seed=0):
-    tfms = [
+def _cifar10_tfms():
+    return T.Compose([
         T.ToTensor(),
         T.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
-    ]
-    base = torchvision.datasets.CIFAR10(
-        root=data_root, train=False, download=True, transform=T.Compose(tfms)
-    )
-    ds = IndexedDataset(base)
+    ])
 
+def sha16(arr: np.ndarray) -> str:
+    arr = np.ascontiguousarray(arr)
+    h = hashlib.sha256(arr.view(np.uint8)).hexdigest()
+    return h[:16]
+
+def make_stratified_val_indices(targets, val_frac=0.1, seed=0, n_classes=10):
+    """
+    Deterministic stratified split of CIFAR-10 train into train/val.
+    Returns (train_idx, val_idx) as sorted numpy arrays.
+    """
+    rng = np.random.default_rng(int(seed))
+    targets = np.asarray(targets, dtype=np.int64)
+    train_idx = []
+    val_idx = []
+    for c in range(n_classes):
+        idx_c = np.where(targets == c)[0]
+        idx_c = rng.permutation(idx_c)
+        n_val = int(round(val_frac * len(idx_c)))
+        val_c = idx_c[:n_val]
+        tr_c = idx_c[n_val:]
+        val_idx.append(val_c)
+        train_idx.append(tr_c)
+    train_idx = np.sort(np.concatenate(train_idx).astype(np.int64))
+    val_idx = np.sort(np.concatenate(val_idx).astype(np.int64))
+    return train_idx, val_idx
+
+def build_loader_from_dataset(ds, batch_size=128, num_workers=4, seed=0, shuffle=False):
+    ds = IndexedDataset(ds)
     g = torch.Generator()
     g.manual_seed(int(seed))
-
     loader = DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=bool(shuffle),
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
@@ -161,27 +185,53 @@ def build_test_loader(data_root="./data", batch_size=128, num_workers=4, seed=0)
     )
     return loader
 
+def build_cifar10_fit_and_test_loaders(
+    data_root="./data",
+    fit_split="val",         # "val" or "train"
+    val_frac=0.1,
+    batch_size=128,
+    num_workers=4,
+    seed=0,
+):
+    """
+    FIT split is from CIFAR-10 train (stratified train/val).
+    TEST split is CIFAR-10 test.
+    """
+    tfms = _cifar10_tfms()
 
-# -------------------------
-# Small helpers
-# -------------------------
-def sha16(arr: np.ndarray) -> str:
-    arr = np.ascontiguousarray(arr)
-    h = hashlib.sha256(arr.view(np.uint8)).hexdigest()
-    return h[:16]
+    train_full = torchvision.datasets.CIFAR10(
+        root=data_root, train=True, download=True, transform=tfms
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=data_root, train=False, download=True, transform=tfms
+    )
 
-def mean_per_class_purity(y_true: np.ndarray, labels: np.ndarray, n_classes: int, k: int) -> float:
-    pur = []
-    for c in range(n_classes):
-        m = (y_true == c)
-        if m.sum() == 0:
-            continue
-        cnt = np.bincount(labels[m], minlength=k).astype(np.float64)
-        pur.append(cnt.max() / cnt.sum())
-    return float(np.mean(pur)) if pur else 0.0
+    train_idx, val_idx = make_stratified_val_indices(train_full.targets, val_frac=val_frac, seed=seed, n_classes=10)
 
-def permutation_pvalue(obs: float, null: np.ndarray) -> float:
-    return float((np.sum(null >= obs) + 1) / (len(null) + 1))
+    if fit_split.lower() == "train":
+        fit_ds = Subset(train_full, train_idx.tolist())
+        fit_name = f"train({len(train_idx)})"
+    elif fit_split.lower() == "val":
+        fit_ds = Subset(train_full, val_idx.tolist())
+        fit_name = f"val({len(val_idx)})"
+    else:
+        raise ValueError("fit_split must be 'train' or 'val'")
+
+    fit_loader = build_loader_from_dataset(fit_ds, batch_size=batch_size, num_workers=num_workers, seed=seed, shuffle=False)
+    test_loader = build_loader_from_dataset(test_ds, batch_size=batch_size, num_workers=num_workers, seed=seed, shuffle=False)
+
+    split_info = {
+        "fit_split": fit_split.lower(),
+        "fit_name": fit_name,
+        "val_frac": float(val_frac),
+        "seed": int(seed),
+        "train_idx_sha16": sha16(train_idx.astype(np.int64)),
+        "val_idx_sha16": sha16(val_idx.astype(np.int64)),
+        "n_train_full": int(len(train_full)),
+        "n_test": int(len(test_ds)),
+        "n_fit": int(len(fit_loader.dataset)),
+    }
+    return fit_loader, test_loader, split_info
 
 
 # -------------------------
@@ -344,15 +394,18 @@ def compute_gain_tilt_from_g(g_store: dict, alpha_store: dict, layer_names):
     tilt = (tilt_raw - tilt_raw.mean()) / (tilt_raw.std() + 1e-12)
     return gain.astype(np.float32), tilt.astype(np.float32), gain_raw.astype(np.float32), tilt_raw.astype(np.float32)
 
+def apply_zscore(x: np.ndarray, mu: float, sd: float):
+    return ((x - mu) / (sd + 1e-12)).astype(np.float32)
+
 
 # -------------------------
 # Swap mapping (structured)
 # -------------------------
-def make_swap_to_pair_extremes_by_mean_gain(gain: np.ndarray, labels: np.ndarray, k: int):
+def make_swap_to_pair_extremes_by_mean_gain(gain_raw: np.ndarray, labels: np.ndarray, k: int):
     mean_gain = np.zeros((k,), dtype=np.float64)
     for c in range(k):
         m = (labels == c)
-        mean_gain[c] = float(gain[m].mean()) if np.any(m) else 0.0
+        mean_gain[c] = float(gain_raw[m].mean()) if np.any(m) else 0.0
     order = np.argsort(mean_gain)
     swap_to = np.arange(k, dtype=np.int64)
     for i in range(k // 2):
@@ -371,7 +424,7 @@ def run_gate_override_inference(
     model,
     loader,
     layer_names,
-    labels,                    # [N]
+    labels,                    # [N] on THIS loader
     swap_to,                   # [k]
     mean_g_by_layer,           # dict ln -> torch [k,K]
     abs_alpha_by_layer=None,   # dict ln -> torch [1,K]
@@ -449,17 +502,14 @@ def run_gate_override_inference(
         amp_diag = {}
         for ln in layer_names:
             r = np.concatenate(amp_ratio_collect[ln], axis=0) if amp_ratio_collect[ln] else None
-            if r is None:
-                amp_diag[ln] = None
-            else:
-                amp_diag[ln] = {
-                    "mean": float(r.mean()),
-                    "p10": float(np.percentile(r, 10)),
-                    "p50": float(np.percentile(r, 50)),
-                    "p90": float(np.percentile(r, 90)),
-                    "min": float(r.min()),
-                    "max": float(r.max()),
-                }
+            amp_diag[ln] = None if r is None else {
+                "mean": float(r.mean()),
+                "p10": float(np.percentile(r, 10)),
+                "p50": float(np.percentile(r, 50)),
+                "p90": float(np.percentile(r, 90)),
+                "min": float(r.min()),
+                "max": float(r.max()),
+            }
 
     return logits_out, amp_diag
 
@@ -581,7 +631,7 @@ def plot_fig3_temp_attribution(base_m, amp_m, amp_nm_m, out_prefix, n_bins=15):
 
     # (a) histogram
     out_a = out_prefix + "_a_hist.png"
-    fig, ax = plt.subplots(figsize=(2.36, 1.8), dpi=600)
+    fig, ax = plt.subplots(figsize=(2.10, 1.8), dpi=600)
     ln_base = base_m["logit_norm"]
     ln_amp  = amp_m["logit_norm"]
     ln_nm   = amp_nm_m["logit_norm"]
@@ -602,7 +652,7 @@ def plot_fig3_temp_attribution(base_m, amp_m, amp_nm_m, out_prefix, n_bins=15):
 
     # (b) reliability 3 curves
     out_b = out_prefix + "_b_reliability.png"
-    fig, ax = plt.subplots(figsize=(2.86, 1.8), dpi=600)
+    fig, ax = plt.subplots(figsize=(2.90, 1.8), dpi=600)
 
     ax.plot([0, 1], [0, 1], "--", linewidth=1.0, alpha=0.8, color=COL_AUX)
     plot_reliability_curve(ax, base_m["maxprob"], (base_m["pred"] == base_m["_y_true"]),
@@ -627,7 +677,7 @@ def plot_fig3_temp_attribution(base_m, amp_m, amp_nm_m, out_prefix, n_bins=15):
     plt.show()
     plt.close(fig)
 
-    # (c) compact metrics table (export names unchanged)
+    # (c) compact metrics table
     out_c = out_prefix + "_c_metrics.png"
 
     col_headers = ["Base", "Amp-\npreserve", "Logit-\nnorm\nmatched"]
@@ -646,7 +696,7 @@ def plot_fig3_temp_attribution(base_m, amp_m, amp_nm_m, out_prefix, n_bins=15):
     cell_text = [[f"{v:.4f}" for v in row] for row in vals]
 
     plt.rcParams.update({"font.family": "serif", "mathtext.fontset": "dejavuserif"})
-    fig_w, fig_h = 2.15, 1.8
+    fig_w, fig_h = 2.16, 1.8
     fs_body = 7.0
     fs_head = 6.3
     lw_topbot = 1.0
@@ -687,7 +737,6 @@ def plot_fig3_temp_attribution(base_m, amp_m, amp_nm_m, out_prefix, n_bins=15):
         for c in range(3):
             ax.text(x_cols[c], y, row[c], ha="center", va="center", fontsize=fs_body)
 
-    # keep your exact bbox logic (do not change appearance)
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     tight = fig.get_tightbbox(renderer)
@@ -703,6 +752,19 @@ def plot_fig3_temp_attribution(base_m, amp_m, amp_nm_m, out_prefix, n_bins=15):
 # -------------------------
 # Sanity suite (label leakage defense)
 # -------------------------
+def mean_per_class_purity(y_true: np.ndarray, labels: np.ndarray, n_classes: int, k: int) -> float:
+    pur = []
+    for c in range(n_classes):
+        m = (y_true == c)
+        if m.sum() == 0:
+            continue
+        cnt = np.bincount(labels[m], minlength=k).astype(np.float64)
+        pur.append(cnt.max() / cnt.sum())
+    return float(np.mean(pur)) if pur else 0.0
+
+def permutation_pvalue(obs: float, null: np.ndarray) -> float:
+    return float((np.sum(null >= obs) + 1) / (len(null) + 1))
+
 def run_sanity_suite(out_dir, y_true, labels, k, n_classes,
                      swap_logits, amp_logits, amp_nm_logits,
                      seed=0, n_bins=15):
@@ -743,7 +805,7 @@ def run_sanity_suite(out_dir, y_true, labels, k, n_classes,
         "p_nmi": float(p_nmi),
         "obs_mean_per_class_purity": float(obs_pur),
         "p_purity": float(p_pur),
-        "note": "labels/logits computed without y_true; y_true only used for evaluation + heatmap rows."
+        "note": "programs/prototypes fit without y_true; y_true only used for evaluation + heatmap rows."
     }
 
     rep_path = os.path.join(out_dir, "sanity_report.json")
@@ -766,6 +828,7 @@ def run_sanity_suite(out_dir, y_true, labels, k, n_classes,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, default="")
+
     ap.add_argument("--data_root", type=str, default="./data")
     ap.add_argument("--out_dir", type=str, default="./maintext_out")
     ap.add_argument("--batch_size", type=int, default=128)
@@ -778,13 +841,18 @@ def main():
     ap.add_argument("--n_bins", type=int, default=15, help="num bins for ECE / reliability diagrams")
     ap.add_argument("--stage3_layers", type=str, default="ALL",
                     help="Comma-separated layer list (e.g. 'l3.0.c1,l3.0.c2') or 'ALL' to use all stage-3 layers.")
-    ap.add_argument("--npz", type=str, default="", help="optional precomputed npz containing gain/tilt (y_true optional)")
     ap.add_argument("--swap_to", type=str, default="", help="optional mapping like '3,2,5,4,0,1'")
+
+    ap.add_argument("--fit_split", type=str, default="val", choices=["val", "train"],
+                    help="Split used to FIT z-score, k-means, prototypes, and paired-extremes mapping.")
+    ap.add_argument("--val_frac", type=float, default=0.10,
+                    help="Validation fraction (stratified) from CIFAR-10 train set (used if fit_split=val).")
+
+    # permutation sweep
     ap.add_argument("--n_perm", type=int, default=20, help="permutation sweep count for Table1")
-
     ap.add_argument("--skip_perm", action="store_true", default=False, help="skip permutation sweep")
-
-    ap.add_argument("--sanity", action="store_true", default=True, help="run label-leakage sanity suite")
+    
+    ap.add_argument("--no_sanity", action="store_true", default=False, help="disable sanity suite")
 
     # model kwargs
     ap.add_argument("--drop_rate", type=float, default=0.1)
@@ -809,7 +877,7 @@ def main():
     sd = strip_module_prefix(extract_state_dict(ckpt_obj))
     classes, K_stages, depth_stages, widths = infer_arch_from_sd(sd)
     print(f"[arch] classes={classes} K={K_stages} depth={depth_stages} widths={widths}")
-    
+
     model = ChebResNet(
         classes=classes,
         K=K_stages,
@@ -840,101 +908,129 @@ def main():
     print("[cfg] layers:", layer_names)
     print("[cfg] num layers used:", len(layer_names))
 
-    # ---- loader
-    loader = build_test_loader(
+    # ---- loaders (FIT + TEST)
+    fit_loader, test_loader, split_info = build_cifar10_fit_and_test_loaders(
         data_root=args.data_root,
+        fit_split=args.fit_split,
+        val_frac=args.val_frac,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         seed=args.seed,
     )
+    print("[split]", json.dumps(split_info, indent=2))
+    with open(os.path.join(args.out_dir, "split_info.json"), "w") as f:
+        json.dump(split_info, f, indent=2)
 
-    N = len(loader.dataset)
-    idx = np.arange(N, dtype=np.int64)
+    # =========================
+    # (1) FIT: codebook (NO y used in features)
+    # =========================
+    print("\n[FIT] collecting g(x) on fit split ...")
+    g_fit, alpha_store = collect_g_per_layer(model, fit_loader, layer_names, device=device)
+    gain_fit, tilt_fit, gain_raw_fit, tilt_raw_fit = compute_gain_tilt_from_g(g_fit, alpha_store, layer_names)
 
-    # ---- optional NPZ (gain/tilt only; y_true deliberately optional)
-    gain, tilt = None, None
-    if args.npz.strip():
-        D = np.load(args.npz, allow_pickle=True)
-        gain = D["gain"].astype(np.float32) if "gain" in D else None
-        tilt = D["tilt"].astype(np.float32) if "tilt" in D else None
-        print("[npz] loaded (gain,tilt) =", (gain is not None and tilt is not None))
+    muG, sdG = float(gain_raw_fit.mean()), float(gain_raw_fit.std() + 1e-12)
+    muT, sdT = float(tilt_raw_fit.mean()), float(tilt_raw_fit.std() + 1e-12)
 
-    # ---- compute base logits (no y_true)
-    base_logits = infer_logits(model, loader, device=device, n_classes=classes)
-    print("[logits] computed base logits; y_true not loaded yet")
-
-    # ---- collect per-sample g(x) and compute labels (still no y_true)
-    print("[gate] collecting per-sample g(x) ...")
-    g_store, alpha_store = collect_g_per_layer(model, loader, layer_names, device=device)
-
-    if gain is None or tilt is None:
-        gain, tilt, gain_raw, tilt_raw = compute_gain_tilt_from_g(g_store, alpha_store, layer_names)
-        np.savez(os.path.join(args.out_dir, "computed_gain_tilt.npz"),
-                 gain=gain, tilt=tilt, gain_raw=gain_raw, tilt_raw=tilt_raw)
-        print("[gain/tilt] computed internally (z-scored). wrote computed_gain_tilt.npz")
-
-    X = np.stack([gain, tilt], axis=1)
+    X_fit = np.stack([gain_fit, tilt_fit], axis=1).astype(np.float32)
     km = KMeans(n_clusters=args.k, random_state=args.seed, n_init=20)
-    labels = km.fit_predict(X).astype(np.int64)
+    labels_fit = km.fit_predict(X_fit).astype(np.int64)
 
-    # ---- choose swap_to (still no y_true)
+    counts_fit = np.bincount(labels_fit, minlength=args.k)
+    print("[FIT] cluster counts:", counts_fit.tolist())
+    if np.any(counts_fit == 0):
+        print("[warn] empty FIT clusters exist; prototypes for those clusters will be zeros.")
+
+    # mapping pi fit on FIT split only
     if args.swap_to.strip():
         swap_to = np.array([int(x) for x in args.swap_to.split(",")], dtype=np.int64)
         assert swap_to.shape[0] == args.k
         mean_gain = None
         print("[swap_to] manual:", swap_to.tolist())
     else:
-        swap_to, mean_gain = make_swap_to_pair_extremes_by_mean_gain(gain, labels, k=args.k)
-        print("[swap_to] paired extremes by mean gain:", swap_to.tolist())
-        print("[swap_to] mean_gain:", mean_gain.tolist())
+        swap_to, mean_gain = make_swap_to_pair_extremes_by_mean_gain(gain_raw_fit, labels_fit, k=args.k)
+        print("[swap_to] paired extremes by mean FIT gain:", swap_to.tolist())
+        print("[swap_to] mean_gain(FIT):", mean_gain.tolist())
 
-    # ---- build mean_g prototypes per cluster per layer, and per-layer A_base(x)
+    # prototypes fit on FIT split only
     mean_g_by_layer = {}
     abs_alpha_by_layer = {}
-    amp_base_by_layer = {}
-
     for ln in layer_names:
         cheb = name_to_mod[ln]
         alpha = cheb.order_scales.detach().cpu().numpy().astype(np.float32)  # [K]
-        g = g_store[ln]  # [N,K]
         abs_alpha = np.abs(alpha).astype(np.float32)
 
-        amp_base = (abs_alpha.reshape(1, -1) * g).sum(axis=1).astype(np.float32)
-        amp_base_by_layer[ln] = amp_base
+        g = g_fit[ln]  # [N_fit,K]
+        s = (alpha.reshape(1, -1) * g).astype(np.float32)  # [N_fit,K]
 
-        s = (alpha.reshape(1, -1) * g).astype(np.float32)
         ms = np.zeros((args.k, s.shape[1]), dtype=np.float32)
         for c in range(args.k):
-            m = (labels == c)
-            if np.any(m):
-                ms[c] = s[m].mean(axis=0)
-            else:
-                ms[c] = 0.0
+            m = (labels_fit == c)
+            ms[c] = s[m].mean(axis=0) if np.any(m) else 0.0
 
         denom = np.where(np.abs(alpha) < 1e-8, 1.0, alpha).astype(np.float32)
-        mg = (ms / denom.reshape(1, -1)).astype(np.float32)
+        mg = (ms / denom.reshape(1, -1)).astype(np.float32)   # == mean gate per cluster
         mg = np.clip(mg, 0.0, 1.0)
 
         mean_g_by_layer[ln] = torch.from_numpy(mg).to(device=device, dtype=torch.float32)
         abs_alpha_by_layer[ln] = torch.from_numpy(abs_alpha.reshape(1, -1)).to(device=device, dtype=torch.float32)
 
-    # ---- NOW load y_true (evaluation only)
-    y_true = np.zeros((N,), dtype=np.int64)
-    for _, yb, idxb in loader:
-        y_true[idxb.numpy().astype(np.int64)] = yb.numpy().astype(np.int64)
-    print("[labels] programs fixed; y_true loaded only for evaluation/plots")
+    fit_art = {
+        "fit_split": split_info["fit_split"],
+        "muG": muG, "sdG": sdG, "muT": muT, "sdT": sdT,
+        "swap_to": swap_to.tolist(),
+        "mean_gain_fit": mean_gain.tolist() if mean_gain is not None else None,
+        "km_centers": km.cluster_centers_.astype(np.float32).tolist(),
+        "cluster_counts_fit": counts_fit.tolist(),
+    }
+    with open(os.path.join(args.out_dir, "fit_artifacts.json"), "w") as f:
+        json.dump(fit_art, f, indent=2)
+    print("[FIT] wrote fit_artifacts.json")
 
-    # ---- baseline metrics
+    # =========================
+    # (2) TEST: assign programs, evaluate base + swaps
+    # =========================
+    print("\n[TEST] computing base logits (labels ignored until eval) ...")
+    base_logits = infer_logits(model, test_loader, device=device, n_classes=classes)
+
+    print("[TEST] collecting g(x) on test (for program assignment + amp-preserve) ...")
+    g_test, alpha_store_test = collect_g_per_layer(model, test_loader, layer_names, device=device)
+    _, _, gain_raw_test, tilt_raw_test = compute_gain_tilt_from_g(g_test, alpha_store_test, layer_names)
+
+    gain_test = apply_zscore(gain_raw_test, muG, sdG)
+    tilt_test = apply_zscore(tilt_raw_test, muT, sdT)
+    X_test = np.stack([gain_test, tilt_test], axis=1).astype(np.float32)
+    labels_test = km.predict(X_test).astype(np.int64)
+
+    counts_test = np.bincount(labels_test, minlength=args.k)
+    print("[TEST] cluster counts:", counts_test.tolist())
+
+    # amp_base computed on TEST base gates
+    amp_base_by_layer = {}
+    for ln in layer_names:
+        cheb = name_to_mod[ln]
+        alpha = cheb.order_scales.detach().cpu().numpy().astype(np.float32)
+        abs_alpha = np.abs(alpha).astype(np.float32)
+        g = g_test[ln]
+        amp_base_by_layer[ln] = (abs_alpha.reshape(1, -1) * g).sum(axis=1).astype(np.float32)
+
+    # now load y_true for evaluation only
+    N_test = len(test_loader.dataset)
+    y_true = np.zeros((N_test,), dtype=np.int64)
+    for _, yb, idxb in test_loader:
+        y_true[idxb.numpy().astype(np.int64)] = yb.numpy().astype(np.int64)
+    print("[TEST] y_true loaded only for evaluation/plots")
+
+    # baseline metrics
     base_m = summarize_metrics(base_logits, y_true, n_bins=args.n_bins)
     base_m["_y_true"] = y_true
     print(f"[base] acc={base_m['acc']:.4f} ent={base_m['entropy_mean']:.4f} nll={base_m['nll']:.4f} "
           f"brier={base_m['brier']:.4f} ece={base_m['ece']:.4f} | ln={base_m['logit_norm_mean']:.4f}")
 
-    # ---- structured swap (plain)
-    print("[swap] running structured swap (plain) ...")
+    # structured swap (plain) on TEST labels with FIT prototypes
+    print("[swap] running paired-extremes swap (plain) ...")
     swap_logits, _ = run_gate_override_inference(
-        model, loader, layer_names,
-        labels=labels, swap_to=swap_to,
+        model, test_loader, layer_names,
+        labels=labels_test, swap_to=swap_to,
         mean_g_by_layer=mean_g_by_layer,
         device=device, n_classes=classes,
         mode="plain",
@@ -944,11 +1040,11 @@ def main():
     print(f"[swap ] acc={swap_m['acc']:.4f} ent={swap_m['entropy_mean']:.4f} nll={swap_m['nll']:.4f} "
           f"brier={swap_m['brier']:.4f} ece={swap_m['ece']:.4f} | ln={swap_m['logit_norm_mean']:.4f}")
 
-    # ---- amp-preserve swap
+    # amp-preserve swap
     print("[amp ] running amp-preserve swap ...")
     amp_logits, amp_diag = run_gate_override_inference(
-        model, loader, layer_names,
-        labels=labels, swap_to=swap_to,
+        model, test_loader, layer_names,
+        labels=labels_test, swap_to=swap_to,
         mean_g_by_layer=mean_g_by_layer,
         abs_alpha_by_layer=abs_alpha_by_layer,
         amp_base_by_layer=amp_base_by_layer,
@@ -960,7 +1056,7 @@ def main():
     print(f"[amp ] acc={amp_m['acc']:.4f} ent={amp_m['entropy_mean']:.4f} nll={amp_m['nll']:.4f} "
           f"brier={amp_m['brier']:.4f} ece={amp_m['ece']:.4f} | ln={amp_m['logit_norm_mean']:.4f}")
 
-    # ---- logit-norm matching
+    # logit-norm matching
     print("[attr] logit-norm matching: amp -> match base norm ...")
     amp_nm_logits = logit_norm_match(amp_logits, base_logits)
     amp_nm_m = summarize_metrics(amp_nm_logits, y_true, n_bins=args.n_bins)
@@ -968,9 +1064,9 @@ def main():
     print(f"[amp norm-matched] acc={amp_nm_m['acc']:.4f} ent={amp_nm_m['entropy_mean']:.4f} nll={amp_nm_m['nll']:.4f} "
           f"brier={amp_nm_m['brier']:.4f} ece={amp_nm_m['ece']:.4f} | ln={amp_nm_m['logit_norm_mean']:.4f}")
 
-    # ---- write figures
+    # ---- write figures (TEST labels)
     fig1_path = os.path.join(args.out_dir, "Fig1_class_x_cluster.png")
-    plot_class_x_cluster_heatmap(y_true=y_true, labels=labels, k=args.k, n_classes=classes, out_path=fig1_path)
+    plot_class_x_cluster_heatmap(y_true=y_true, labels=labels_test, k=args.k, n_classes=classes, out_path=fig1_path)
     print("[ok] wrote", fig1_path, "(.pdf too)")
 
     fig2_path = os.path.join(args.out_dir, "Fig2_reliability_base_vs_swap.png")
@@ -984,21 +1080,21 @@ def main():
     print("[ok]", fig3_prefix + "_b_reliability.{png,pdf}")
     print("[ok]", fig3_prefix + "_c_metrics.{png,pdf}")
 
-    # ---- Table1: permutation robustness (structured swap only)
+    # ---- Table1: permutation robustness (structured swap only, TEST eval)
     perm_csv = os.path.join(args.out_dir, "Table1_perm_sweep_detail.csv")
     perm_sum_csv = os.path.join(args.out_dir, "Table1_perm_sweep_summary.csv")
 
     if args.skip_perm:
         print("[perm] skipped")
     else:
-        print(f"[perm] permutation sweep n_perm={args.n_perm} (structured swap, plain) ...")
+        print(f"[perm] permutation sweep n_perm={args.n_perm} (structured swap, plain; TEST eval) ...")
         rng = np.random.default_rng(args.seed)
         rows = []
         for t in range(args.n_perm):
             perm = rng.permutation(args.k).astype(np.int64)
             logits_t, _ = run_gate_override_inference(
-                model, loader, layer_names,
-                labels=labels, swap_to=perm,
+                model, test_loader, layer_names,
+                labels=labels_test, swap_to=perm,
                 mean_g_by_layer=mean_g_by_layer,
                 device=device, n_classes=classes,
                 mode="plain",
@@ -1027,13 +1123,18 @@ def main():
     out_npz = os.path.join(args.out_dir, "maintext_artifacts.npz")
     np.savez(
         out_npz,
-        idx=idx,
         y_true=y_true,
-        gain=gain,
-        tilt=tilt,
-        labels=labels,
+        labels_test=labels_test,
         swap_to=swap_to,
         layer_names=np.array(layer_names, dtype=object),
+
+        fit_muG=np.array([muG], dtype=np.float32),
+        fit_sdG=np.array([sdG], dtype=np.float32),
+        fit_muT=np.array([muT], dtype=np.float32),
+        fit_sdT=np.array([sdT], dtype=np.float32),
+
+        gain_raw_test=gain_raw_test,
+        tilt_raw_test=tilt_raw_test,
 
         base_logits=base_logits,
         swap_logits=swap_logits,
@@ -1046,22 +1147,23 @@ def main():
         amp_normmatched_metrics=json.dumps({k: v for k, v in amp_nm_m.items() if not isinstance(v, np.ndarray)}),
 
         amp_preserve_diag=json.dumps(amp_diag if amp_diag is not None else {}),
+        split_info=json.dumps(split_info),
     )
     print("[ok] wrote", out_npz)
 
     # ---- concise main-text numbers
-    print("\n=== MAIN-TEXT KEY NUMBERS ===")
+    print("\n=== MAIN-TEXT KEY NUMBERS (TEST eval; FIT codebook) ===")
     print(f"base: acc={base_m['acc']:.4f} ECE={base_m['ece']:.4f} NLL={base_m['nll']:.4f} Brier={base_m['brier']:.4f} mean||z||={base_m['logit_norm_mean']:.4f}")
     print(f"swap: acc={swap_m['acc']:.4f} ECE={swap_m['ece']:.4f} NLL={swap_m['nll']:.4f} Brier={swap_m['brier']:.4f} mean||z||={swap_m['logit_norm_mean']:.4f}")
     print(f"amp : acc={amp_m['acc']:.4f} ECE={amp_m['ece']:.4f} NLL={amp_m['nll']:.4f} Brier={amp_m['brier']:.4f} mean||z||={amp_m['logit_norm_mean']:.4f}")
     print(f"amp norm-matched: acc={amp_nm_m['acc']:.4f} ECE={amp_nm_m['ece']:.4f} NLL={amp_nm_m['nll']:.4f} Brier={amp_nm_m['brier']:.4f} mean||z||={amp_nm_m['logit_norm_mean']:.4f}")
-    print("=============================\n")
+    print("========================================================\n")
 
-    if args.sanity:
+    if not args.no_sanity:
         run_sanity_suite(
             out_dir=args.out_dir,
             y_true=y_true,
-            labels=labels,
+            labels=labels_test,
             k=args.k,
             n_classes=classes,
             swap_logits=swap_logits,
