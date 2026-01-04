@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chebgate"
+version = "0.1.0"
+description = "ChebGate: gated Chebyshev polynomial filtering blocks and order-mixing program analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "matplotlib",
+  "scikit-learn",
+  "torch",
+  "torchvision",
+]
+
+[tool.setuptools]
+packages = ["chebgate"]
