@@ -8,6 +8,10 @@ Tested configuration (example from our runs):
 - PyTorch 2.5.1 + CUDA 12.1 (cuDNN 9.x)
 - GPU: NVIDIA L4
 
+### Install
+Create an environment and install dependencies:
+pip install -e
+
 ### Quickstart (train + benchmark with fairness harness)
 
 DATA_DIR=$HOME/datasets
