@@ -10,7 +10,7 @@ Tested configuration (example from our runs):
 
 ### Install
 Create an environment and install dependencies:
-pip install -e
+pip install -e .
 
 ### Quickstart (train + benchmark with fairness harness)
 
