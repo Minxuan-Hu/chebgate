@@ -841,7 +841,7 @@ def main():
 
     # Model knobs
     p.add_argument("--widths", type=str, default="192,384,768")
-    p.add_argument("--K", type=str, default="4,5,6")
+    p.add_argument("--K", type=str, default="3,5,5")
     p.add_argument("--depth", type=str, default="7,7,7")
     p.add_argument("--drop_rate", type=float, default=0.2)
     p.add_argument("--lambda_lap", type=float, default=0.25)
