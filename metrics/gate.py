@@ -2,9 +2,9 @@ import os
 import csv
 import torch
 
-from chebgate.core.io import write_json
-from chebgate.core.state_dict import _unwrap_compiled
-from chebgate.model.chebconv import ChebConv2d
+from core import write_json
+from core import _unwrap_compiled
+from model import ChebConv2d
 
 
 @torch.no_grad()
