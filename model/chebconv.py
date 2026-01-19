@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chebgate.core.fp32 import fp32_reference_mode
+from core import fp32_reference_mode
 
 
 class ChebConv2d(nn.Module):
