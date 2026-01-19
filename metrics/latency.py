@@ -4,8 +4,8 @@ import json
 import numpy as np
 import torch
 
-from chebgate.core.io import append_csv_row, write_json
-from chebgate.core.parse import amp_dtype_name
+from core import append_csv_row, write_json
+from core import amp_dtype_name
 
 
 def _as_device(device):
