@@ -1,7 +1,7 @@
 import time
 import torch
 
-from chebgate.core.sync import _sync_if_cuda
+from core import _sync_if_cuda
 from .augment import cutmix, accuracy_mix
 
 
