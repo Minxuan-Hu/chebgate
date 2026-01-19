@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from chebgate.core.droppath import DropPath
+from core import DropPath
 from .chebconv import ChebConv2d
 
 
