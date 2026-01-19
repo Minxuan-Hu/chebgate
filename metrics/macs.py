@@ -2,7 +2,7 @@ import csv
 import torch
 import torch.nn as nn
 
-from chebgate.model.chebconv import ChebConv2d
+from model import ChebConv2d
 
 
 @torch.no_grad()
