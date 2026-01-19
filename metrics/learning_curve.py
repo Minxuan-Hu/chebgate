@@ -1,5 +1,5 @@
 import os
-from chebgate.core.io import append_csv_row
+from core import append_csv_row
 
 
 def save_learning_curve_csv(logdir: str, row: dict):
