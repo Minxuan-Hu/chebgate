@@ -1,9 +1,9 @@
 import torch
 
-from chebgate.core.fp32 import fp32_reference_mode
-from chebgate.core.state_dict import strip_orig_mod_prefix, load_state_dict_portable, _unwrap_compiled
-from chebgate.model.net import ChebResNet
-from chebgate.model.chebconv import ChebConv2d
+from core import fp32_reference_mode
+from core import strip_orig_mod_prefix, load_state_dict_portable, _unwrap_compiled
+from model import ChebResNet
+from model import ChebConv2d
 
 
 @torch.no_grad()
