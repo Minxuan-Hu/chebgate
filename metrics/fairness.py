@@ -1,11 +1,11 @@
 import os, json
 import torch
 
-from chebgate.core.hashing import state_dict_sha256
-from chebgate.core.parse import amp_dtype_name
-from chebgate.core.io import append_csv_row
-from chebgate.core.state_dict import strip_orig_mod_prefix, load_state_dict_portable
-from chebgate.model.net import ChebResNet
+from core import state_dict_sha256
+from core import amp_dtype_name
+from core import append_csv_row
+from core import strip_orig_mod_prefix, load_state_dict_portable
+from model import ChebResNet
 from .latency import latency_ms_samples
 
 
