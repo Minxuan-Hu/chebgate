@@ -26,7 +26,7 @@ import sklearn
 from sklearn.cluster import KMeans
 from sklearn.metrics import normalized_mutual_info_score
 
-from chebgate.model import ChebResNet, ChebConv2d
+from model import ChebResNet, ChebConv2d
 
 
 # -------------------------
