@@ -1,74 +1,223 @@
 #!/usr/bin/env python3
-"""
-ChebGate / ChebResNet TinyImageNet TPU training + evaluation + profiling entrypoint.
-"""
 
 import argparse
-import inspect
-import math
 import os
-import platform
+import random
+import shutil
+import sys
 import time
-from typing import Dict, Tuple
+import urllib.request
+import zipfile
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision
 import torchvision.transforms as T
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-from chebgate.core import (
-    set_seed,
-    ensure_logdir,
-    write_json,
-    parse_tuple_ints,
-    amp_dtype_name,
-    state_dict_uncompiled,
-    _unwrap_compiled,
-)
-from chebgate.core.io import append_csv_row
-from chebgate.core.state_dict import load_state_dict_portable
-from chebgate.core.hashing import state_dict_sha256
+from model import ChebResNet
 
-from chebgate.core.checkpoint import (
-    load_checkpoint,
-    pack_split_indices,
-)
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
-from chebgate.data import (
-    ensure_tinyimagenet_ready,
-    get_tinyimagenet_train_labels,
-    make_stratified_split_indices,
-    build_tinyimagenet_datasets,
-)
 
-from chebgate.model import ChebResNet
-from chebgate.training import train_epoch, evaluate
-from chebgate.metrics import (
-    count_parameters,
-    profile_macs,
-    profile_macs_breakdown,
-    save_learning_curve_csv,
-    collect_gate_stats,
-    dump_order_scales,
-)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _worker_init_fn(base_seed: int, rank: int):
+    def _init(worker_id: int):
+        s = int(base_seed) + int(rank) * 1000 + int(worker_id)
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+
+    return _init
+
 
 # ----------------------------
-# TPU/XLA helpers
+# Tiny-ImageNet utilities
 # ----------------------------
+def ensure_tinyimagenet_ready(data_root: str, log_fn=None) -> str:
+    ds_root = os.path.join(data_root, "tiny-imagenet-200")
+    if os.path.isdir(ds_root):
+        return ds_root
 
-def _xla_imports():
-    import torch_xla.core.xla_model as xm
-    import torch_xla.runtime as xr
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    return xm, xr, pl, xmp
+    os.makedirs(data_root, exist_ok=True)
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    zip_path = os.path.join(data_root, "tiny-imagenet-200.zip")
+
+    if log_fn:
+        log_fn(f"[data] Downloading Tiny-ImageNet from {url} -> {zip_path}")
+    else:
+        print(f"[data] Downloading Tiny-ImageNet -> {zip_path}", flush=True)
+
+    urllib.request.urlretrieve(url, zip_path)
+
+    if log_fn:
+        log_fn(f"[data] Extracting {zip_path} -> {data_root}")
+    else:
+        print(f"[data] Extracting...", flush=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(data_root)
+
+    try:
+        os.remove(zip_path)
+    except Exception:
+        pass
+
+    return ds_root
 
 
-def _to_cpu_obj(obj):
-    """Recursively move tensors to CPU for torch.save compatibility."""
-    if isinstance(obj, torch.Tensor):
+def ensure_val_reorganized(ds_root: str, log_fn=None) -> None:
+    marker = os.path.join(ds_root, "val", ".reorg_done")
+    if os.path.isfile(marker):
+        return
+
+    vdir = os.path.join(ds_root, "val")
+    imgs_dir = os.path.join(vdir, "images")
+    ann = os.path.join(vdir, "val_annotations.txt")
+    if (not os.path.isdir(imgs_dir)) or (not os.path.isfile(ann)):
+        raise RuntimeError(f"Unexpected Tiny-ImageNet val structure under: {vdir}")
+
+    if log_fn:
+        log_fn("[data] Reorganizing val/ images by class...")
+    else:
+        print("[data] Reorganizing val/ images by class...", flush=True)
+
+    moved = 0
+    with open(ann, "r") as f:
+        for line in f:
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            img, cls = parts[0], parts[1]
+            src = os.path.join(imgs_dir, img)
+            if not os.path.exists(src):
+                continue
+            dst_dir = os.path.join(imgs_dir, cls)
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.move(src, os.path.join(dst_dir, img))
+            moved += 1
+
+    with open(marker, "w") as f:
+        f.write(f"moved={moved}\n")
+
+
+def stratified_split_indices(labels: np.ndarray, val_frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.RandomState(seed)
+    labels = np.asarray(labels)
+    n = labels.shape[0]
+
+    train_idx = []
+    val_idx = []
+    for c in np.unique(labels):
+        idx_c = np.where(labels == c)[0]
+        rng.shuffle(idx_c)
+        nv = int(round(len(idx_c) * float(val_frac)))
+        nv = max(1, nv)
+        val_idx.append(idx_c[:nv])
+        train_idx.append(idx_c[nv:])
+
+    train_idx = np.concatenate(train_idx) if len(train_idx) else np.arange(n)
+    val_idx = np.concatenate(val_idx) if len(val_idx) else np.array([], dtype=np.int64)
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    return train_idx.astype(np.int64), val_idx.astype(np.int64)
+
+
+# ----------------------------
+# MixUp / CutMix on CPU (collate_fn)
+# ----------------------------
+def _as_label_tensor(labels):
+    if torch.is_tensor(labels[0]):
+        return torch.stack([lab.view(()) for lab in labels]).long()
+    return torch.tensor(labels, dtype=torch.long)
+
+
+def mixup_cpu(x: torch.Tensor, y: torch.Tensor, alpha: float):
+    if alpha is None or float(alpha) <= 0.0:
+        return x, y, y, 1.0, 0.0
+    lam = np.random.beta(alpha, alpha)
+    B = x.size(0)
+    perm = torch.randperm(B)
+    x2 = x[perm]
+    y2 = y[perm]
+    x_mix = lam * x + (1.0 - lam) * x2
+    return x_mix, y, y2, float(lam), float(1.0 - lam)
+
+
+def cutmix_cpu(x: torch.Tensor, y: torch.Tensor, alpha: float):
+    if alpha is None or float(alpha) <= 0.0:
+        return x, y, y, 1.0, 0.0
+
+    lam = np.random.beta(alpha, alpha)
+    B, C, H, W = x.shape
+    perm = torch.randperm(B)
+    y1, y2 = y, y[perm]
+
+    cut_rat = np.sqrt(1.0 - lam)
+    ch, cw = int(H * cut_rat), int(W * cut_rat)
+    cy, cx = np.random.randint(H), np.random.randint(W)
+
+    y1_i, x1_i = max(cy - ch // 2, 0), max(cx - cw // 2, 0)
+    y2_i, x2_i = min(cy + ch // 2, H), min(cx + cw // 2, W)
+
+    x = x.clone()
+    x[:, :, y1_i:y2_i, x1_i:x2_i] = x[perm, :, y1_i:y2_i, x1_i:x2_i]
+
+    lam_adj = 1.0 - ((y2_i - y1_i) * (x2_i - x1_i) / (H * W))
+    lam1 = float(lam_adj)
+    lam2 = float(1.0 - lam1)
+    return x, y1, y2, lam1, lam2
+
+
+def make_mix_collate(mix_alpha: float, cut_alpha: float, cut_prob: float):
+    mix_alpha = float(mix_alpha)
+    cut_alpha = float(cut_alpha)
+    cut_prob = float(cut_prob)
+
+    def collate(batch):
+        xs, ys = zip(*batch)
+        x = torch.stack(xs, dim=0)
+        y = _as_label_tensor(ys)
+
+        if (mix_alpha <= 0.0) and (cut_alpha <= 0.0):
+            return x, y, y, 1.0, 0.0
+
+        use_cut = (cut_alpha > 0.0) and (random.random() < cut_prob)
+        if use_cut:
+            return cutmix_cpu(x, y, cut_alpha)
+        else:
+            return mixup_cpu(x, y, mix_alpha)
+
+    return collate
+
+
+@torch.no_grad()
+def accuracy_mix(logits: torch.Tensor, y1: torch.Tensor, y2: torch.Tensor, lam1: float, lam2: float) -> torch.Tensor:
+    pred = logits.argmax(dim=1)
+    c1 = (pred == y1).to(torch.float32)
+    c2 = (pred == y2).to(torch.float32)
+    return float(lam1) * c1.mean() + float(lam2) * c2.mean()
+
+
+# ----------------------------
+# Checkpoint helpers
+# ----------------------------
+def _to_cpu_obj(obj: Any) -> Any:
+    if torch.is_tensor(obj):
         return obj.detach().cpu()
     if isinstance(obj, dict):
         return {k: _to_cpu_obj(v) for k, v in obj.items()}
@@ -78,672 +227,519 @@ def _to_cpu_obj(obj):
     return obj
 
 
-def snapshot_hardware_tpu(logdir: str, cfg, device_str: str, rank: int, world: int, epoch_seconds=None):
-    info = {
-        "python": platform.python_version(),
-        "pytorch": torch.__version__,
-        "device": device_str,
-        "xla_rank": int(rank),
-        "xla_world_size": int(world),
-        "deterministic": bool(getattr(cfg, "deterministic", 0)),
-        "amp": bool(getattr(cfg, "amp", 0)),
-        "amp_dtype_train": amp_dtype_name(getattr(cfg, "amp_dtype_train", None)),
-        "eval_amp": bool(getattr(cfg, "eval_amp", 0)),
-        "amp_dtype_eval": amp_dtype_name(getattr(cfg, "amp_dtype_eval", None)),
-        "batch_size": int(cfg.bs),
-        "epochs": int(cfg.epochs),
-        "dataset": "tinyimagenet",
-        "realization": cfg.realization,
-        "gate_mode": cfg.gate_mode,
-        "lambda_lap": float(cfg.lambda_lap),
-        "stabilize_cheb": bool(cfg.stabilize_cheb),
-    }
-    if epoch_seconds:
-        info.update(
-            {
-                "epoch_time_mean_s": float(np.mean(epoch_seconds)),
-                "epoch_time_median_s": float(np.median(epoch_seconds)),
-                "epoch_time_minmax_s": [float(np.min(epoch_seconds)), float(np.max(epoch_seconds))],
-            }
-        )
-    write_json(info, os.path.join(logdir, "hardware_env.json"))
-    return info
+def _atomic_torch_save(obj: Any, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
+def load_checkpoint_if_exists(path: str) -> Optional[Dict[str, Any]]:
+    if not os.path.isfile(path):
+        return None
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+# ----------------------------
+# XLA-safe autocast
+# ----------------------------
+def _safe_autocast_xla(dtype: Optional[torch.dtype]):
+    if dtype is None:
+        return torch.autocast("cpu", enabled=False)
+    try:
+        return torch.autocast(device_type="xla", dtype=dtype)
+    except Exception:
+        return torch.autocast("cpu", enabled=False)
+
+
+# ----------------------------
+# Eval / Train
+# ----------------------------
 @torch.no_grad()
-def xla_latency_ms_samples(net: nn.Module, shape: Tuple[int, int, int, int], iters: int, warmup: int, device):
-    """
-    TPU/XLA latency: time forward passes with explicit XLA synchronization.
-    Returns dict compatible with your existing latency JSON schema.
-    """
-    xm, _, _, _ = _xla_imports()
-    net.eval()
+def evaluate_xla(model: nn.Module, loader: Iterable, crit: nn.Module, device, amp_dtype: Optional[torch.dtype]):
+    import torch_xla.core.xla_model as xm
 
-    x = torch.randn(shape, device=device)
+    model.eval()
+    loss_sum = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device, dtype=torch.float32)
+    total = torch.zeros((), device=device, dtype=torch.float32)
 
-    # Warmup
-    for _ in range(warmup):
-        _ = net(x)
+    for xb, yb in loader:
+        with _safe_autocast_xla(amp_dtype):
+            logits = model(xb)
+            loss = crit(logits, yb)
+
+        bs = float(yb.numel())
+        loss_sum += loss.detach() * bs
+        pred = logits.argmax(dim=1)
+        correct += (pred == yb).to(torch.float32).sum()
+        total += bs
         xm.mark_step()
-    xm.wait_device_ops()
 
-    times_ms = []
-    for _ in range(iters):
-        t0 = time.time()
-        _ = net(x)
-        xm.mark_step()
-        xm.wait_device_ops()
-        t1 = time.time()
-        times_ms.append((t1 - t0) * 1000.0)
-
-    arr = np.asarray(times_ms, dtype=np.float64)
-    stats = {
-        "mean_ms": float(arr.mean()),
-        "std_ms": float(arr.std(ddof=0)),
-        "median_ms": float(np.median(arr)),
-        "p10_ms": float(np.percentile(arr, 10)),
-        "p90_ms": float(np.percentile(arr, 90)),
-        "iters": int(iters),
-        "warmup": int(warmup),
-        "imgs_per_s": float((shape[0] * 1000.0) / max(1e-9, arr.mean())),
-    }
-    return stats
+    vec = torch.stack([loss_sum, correct, total])
+    vec = xm.all_reduce(xm.REDUCE_SUM, vec)
+    loss_avg = (vec[0] / vec[2]).item() if vec[2].item() > 0 else float("nan")
+    acc = (vec[1] / vec[2] * 100.0).item() if vec[2].item() > 0 else float("nan")
+    return loss_avg, acc
 
 
-def xla_fairness_latency_all(
-    base_state_dict_cpu: Dict[str, torch.Tensor],
-    model_cfg: Dict[str, object],
-    realizations,
-    logdir: str,
+def train_epoch_xla(
+    model: nn.Module,
+    loader: Iterable,
+    crit: nn.Module,
+    opt: torch.optim.Optimizer,
+    sched: torch.optim.lr_scheduler._LRScheduler,
     device,
-    batch_sizes,
-    tag: str = "all_realizations_xla",
+    amp_dtype: Optional[torch.dtype],
+    log0,
+    log_every: int,
 ):
-    """
-    TPU/XLA version of fairness latency sweep across realizations.
-    Writes one CSV aligned to existing fairness CSV schema (with exec_mode='xla').
-    """
-    weight_meta = state_dict_sha256(base_state_dict_cpu)
+    import torch_xla.core.xla_model as xm
 
-    path = os.path.join(logdir, f"latency_sweep_{tag}.csv")
-    header = [
-        "realization",
-        "batch_size",
-        "mean_ms",
-        "std_ms",
-        "median_ms",
-        "p10_ms",
-        "p90_ms",
-        "imgs_per_s",
-        "iters",
-        "warmup",
-        "exec_mode",
-        "compile_attempted",
-        "compiled",
-        "compile_mode",
-        "fullgraph",
-        "amp_dtype",
-        "weights_sha256",
-        "weights_numel",
-    ]
+    model.train()
+    loss_sum = torch.zeros((), device=device)
+    correct_sum = torch.zeros((), device=device, dtype=torch.float32)
+    total = torch.zeros((), device=device, dtype=torch.float32)
 
-    iters, warmup = 200, 50
-    amp_name = ""  # XLA AMP not tracked here; keep schema but empty
+    steps = 0
+    for batch in loader:
+        xb, y1, y2, lam1, lam2 = batch
+        lam1f, lam2f = float(lam1), float(lam2)
 
-    for r in realizations:
-        net = ChebResNet(
-            classes=int(model_cfg["classes"]),
-            K=model_cfg["K"],
-            depth=model_cfg["depth"],
-            widths=model_cfg["widths"],
-            drop_rate=float(model_cfg["drop_rate"]),
-            lap=float(model_cfg["lap"]),
-            realization=str(r),
-            gate_mode=str(model_cfg["gate_mode"]),
-            stabilize_cheb=bool(model_cfg["stabilize_cheb"]),
-        ).to(device)
-        net = net.to(memory_format=torch.channels_last)
-        load_state_dict_portable(net, base_state_dict_cpu, strict=True)
-        net.eval()
+        opt.zero_grad(set_to_none=True)
 
-        for bs in batch_sizes:
-            stats = xla_latency_ms_samples(
-                net,
-                shape=(int(bs), 3, 64, 64),
-                iters=iters,
-                warmup=warmup,
-                device=device,
-            )
-            append_csv_row(
-                path,
-                header,
-                {
-                    "realization": r,
-                    "batch_size": int(bs),
-                    "mean_ms": stats["mean_ms"],
-                    "std_ms": stats["std_ms"],
-                    "median_ms": stats["median_ms"],
-                    "p10_ms": stats["p10_ms"],
-                    "p90_ms": stats["p90_ms"],
-                    "imgs_per_s": stats["imgs_per_s"],
-                    "iters": iters,
-                    "warmup": warmup,
-                    "exec_mode": "xla",
-                    "compile_attempted": 0,
-                    "compiled": 0,
-                    "compile_mode": "",
-                    "fullgraph": 0,
-                    "amp_dtype": amp_name,
-                    "weights_sha256": weight_meta["sha256"],
-                    "weights_numel": weight_meta["numel"],
-                },
-            )
+        with _safe_autocast_xla(amp_dtype):
+            logits = model(xb)
+            loss = lam1f * crit(logits, y1) + lam2f * crit(logits, y2)
+
+        loss.backward()
+        xm.optimizer_step(opt, barrier=True)
+        sched.step()
+
+        bs = float(y1.numel())
+        loss_sum += loss.detach() * bs
+        correct_sum += (accuracy_mix(logits, y1, y2, lam1f, lam2f) * bs)
+        total += bs
+
+        steps += 1
+        xm.mark_step()
+
+        if log_every > 0 and (steps % log_every == 0):
+            lr_show = opt.param_groups[0]["lr"]
+            log0(f"  step {steps:05d} | loss {loss.item():.4f} | lr {lr_show:.6g} | lam1 {lam1f:.3f}")
+
+    vec = torch.stack([loss_sum, correct_sum, total])
+    vec = xm.all_reduce(xm.REDUCE_SUM, vec)
+    loss_avg = (vec[0] / vec[2]).item() if vec[2].item() > 0 else float("nan")
+    acc = (vec[1] / vec[2] * 100.0).item() if vec[2].item() > 0 else float("nan")
+    return loss_avg, acc, steps
 
 
 # ----------------------------
 # TPU worker
 # ----------------------------
-
 def _mp_fn(index, cfg):
-    xm, xr, pl, _ = _xla_imports()
-
-    device = xm.xla_device()
-    rank, world = xr.global_ordinal(), xr.world_size()
-    mprint = xm.master_print
-
-    # Seed per rank (consistent with your reference TPU code)
-    set_seed(int(cfg.seed) + int(rank))
-
-    # Make sure data exists (locks/markers handle mp safety)
-    ensure_tinyimagenet_ready(cfg.data)
-
-    # Transforms (TinyImageNet 64x64)
-    mean, std = (0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)
-
-    class _Identity:
-        def __call__(self, x):
-            return x
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
+    import torch_xla.distributed.parallel_loader as pl
 
     try:
-        aug = T.RandAugment(3, 9)
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
     except Exception:
-        aug = _Identity()
+        pass
+
+    device = torch_xla.device()
+    rank, world = xr.global_ordinal(), xr.world_size()
+    is_rank0 = (rank == 0)
+
+    os.makedirs(cfg.logdir, exist_ok=True)
+    rank0_log_f = None
+    if is_rank0:
+        rank0_log_f = open(os.path.join(cfg.logdir, "stdout_rank0.log"), "a", buffering=1)
+
+    def log0(msg: str) -> None:
+        if is_rank0:
+            print(msg, flush=True)
+            if rank0_log_f is not None:
+                rank0_log_f.write(msg + "\n")
+                rank0_log_f.flush()
+
+    set_seed(int(cfg.seed) + int(rank))
+
+    if is_rank0:
+        ds_root = ensure_tinyimagenet_ready(cfg.data, log_fn=log0)
+    xm.rendezvous("tinyimagenet_downloaded")
+
+    ds_root = os.path.join(cfg.data, "tiny-imagenet-200")
+    if is_rank0:
+        ensure_val_reorganized(ds_root, log_fn=log0)
+    xm.rendezvous("tinyimagenet_val_reorg")
+
+    if is_rank0:
+        log0(f"[TPU] PJRT_DEVICE={os.environ.get('PJRT_DEVICE','')} | world_size={world} | device={device}")
+        log0(
+            f"[DL] workers={cfg.num_workers} | persistent_workers={cfg.persistent_workers} | "
+            f"prefetch_factor={cfg.prefetch_factor} | pin_memory={cfg.pin_memory}"
+        )
+        log0(
+            f"[Mix] mix_alpha={cfg.mix_alpha} | cut_alpha={cfg.cut_alpha} | cut_prob={cfg.cut_prob} "
+            f"(CPU collate; XLA RNG avoided)"
+        )
+        log0(
+            f"[Model] realization={cfg.realization} | gate_mode={cfg.gate_mode} | "
+            f"lambda_lap={cfg.lambda_lap} | stabilize_cheb={cfg.stabilize_cheb} | drop_rate={cfg.drop_rate}"
+        )
+
+    # Transforms
+    mean, std = (0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)
+    try:
+        ra = T.RandAugment(int(cfg.ra_n), int(cfg.ra_m))
+    except Exception:
+        ra = nn.Identity()
 
     tf_train = T.Compose(
         [
-            aug,
+            ra,
             T.RandomCrop(64, padding=8, padding_mode="reflect"),
             T.RandomHorizontalFlip(),
             T.ToTensor(),
             T.Normalize(mean, std),
+            T.RandomErasing(p=0.25, scale=(0.02, 0.2)),
         ]
     )
     tf_eval = T.Compose([T.ToTensor(), T.Normalize(mean, std)])
 
-    # Model cfg
-    widths = parse_tuple_ints(cfg.widths)
-    Ktup = parse_tuple_ints(cfg.K)
-    depth = parse_tuple_ints(cfg.depth)
-    classes = 200
+    # Build datasets + split (resume uses saved indices)
+    train_root = os.path.join(ds_root, "train")
+    val_images_root = os.path.join(ds_root, "val", "images")
 
-    net = ChebResNet(
-        classes=classes,
-        K=Ktup,
-        depth=depth,
-        widths=widths,
-        drop_rate=cfg.drop_rate,
-        lap=cfg.lambda_lap,
-        realization=cfg.realization,
-        gate_mode=cfg.gate_mode,
-        stabilize_cheb=bool(cfg.stabilize_cheb),
-    ).to(device)
-    net = net.to(memory_format=torch.channels_last)
+    full_for_labels = torchvision.datasets.ImageFolder(train_root, transform=None)
+    labels = np.array([y for _, y in full_for_labels.samples], dtype=np.int64)
 
-    # Optimizer / sched / loss
-    order_p, other_p = [], []
-    for n, par in net.named_parameters():
-        (order_p if "order_scales" in n else other_p).append(par)
-
-    used_lr = cfg.lr * (cfg.bs / 128.0) if int(cfg.auto_lr) else cfg.lr
-    if xm.is_master_ordinal():
-        mprint(f"[opt] bs={cfg.bs} | base_lr={cfg.lr:.4f} | auto_lr={cfg.auto_lr} → used_lr={used_lr:.4f}")
-
-    opt = torch.optim.SGD(
-        [{"params": other_p}, {"params": order_p, "lr": used_lr * 0.1}],
-        lr=used_lr,
-        momentum=0.9,
-        weight_decay=cfg.wd,
-        nesterov=True,
-    )
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.epochs)
-    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-    # AMP (TPU): we only pass dtype through to your train_epoch/evaluate;
-    # your implementation decides whether/how to autocast on XLA.
-    amp_dtype_train = torch.bfloat16 if int(cfg.amp) else None
-    amp_dtype_eval = amp_dtype_train if (int(cfg.eval_amp) and amp_dtype_train is not None) else None
-    cfg.amp_dtype_train = amp_dtype_train
-    cfg.amp_dtype_eval = amp_dtype_eval
-    scaler = None  # no GradScaler on TPU
-
-    # Resume (checkpoint.pth stores split indices only inside checkpoint)
     ckpt_path = os.path.join(cfg.logdir, "checkpoint.pth")
     best_path = os.path.join(cfg.logdir, "best_model.pth")
-    best_meta = os.path.join(cfg.logdir, "best_model_meta.json")
 
     start_ep = 0
-    best_val_acc = -float("inf")
-    best_epoch = -1
+    best_val = -float("inf")
     train_idx = None
     val_idx = None
 
-    if os.path.isfile(ckpt_path):
-        try:
-            info = load_checkpoint(
-                ckpt_path,
-                model=net,
-                optimizer=opt,
-                scheduler=sched,
-                map_location="cpu",
-                strict_model=True,
-                restore_rng=False,  # rank-seeded determinism; avoid rank-mismatch restores
-            )
-            start_ep = int(info["epoch"]) + 1
-            best_val_acc = float(info["best_val"])
-            train_idx = info["train_idx"]
-            val_idx = info["val_idx"]
-            if xm.is_master_ordinal():
-                mprint(f"[resume] Loaded {ckpt_path} → start_ep={start_ep}, best_val_acc={best_val_acc:.2f}")
-        except Exception as e:
-            if xm.is_master_ordinal():
-                mprint(f"[resume] Failed to load checkpoint; starting fresh. Error: {e}")
+    # ----------------------------
+    # Model construction
+    # ----------------------------
+    net = ChebResNet(
+        classes=200,
+        K=tuple(cfg.K),
+        depth=tuple(cfg.depth),
+        widths=tuple(cfg.widths),
+        drop_rate=float(cfg.drop_rate),
+        lap=float(cfg.lambda_lap),
+        realization=str(cfg.realization),
+        gate_mode=str(cfg.gate_mode),
+        stabilize_cheb=bool(int(cfg.stabilize_cheb)),
+    ).to(device)
 
-    # Split indices
-    if train_idx is None or val_idx is None:
-        labels = get_tinyimagenet_train_labels(cfg.data)
-        tr_idx, va_idx = make_stratified_split_indices(labels, seed=int(cfg.seed), val_frac=0.1)
-        train_idx, val_idx = tr_idx, va_idx
-        if xm.is_master_ordinal():
-            mprint(f"[split] Created stratified split: train={len(train_idx)} val={len(val_idx)} (seed={cfg.seed})")
+    if int(cfg.channels_last):
+        net = net.to(memory_format=torch.channels_last)
 
-    # Datasets
-    train_ds, val_ds, test_ds = build_tinyimagenet_datasets(
-        cfg.data,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        tf_train=tf_train,
-        tf_eval=tf_eval,
-        use_val_as_test=True,
+    # Optimizer / loss / scheduler
+    opt = torch.optim.SGD(
+        net.parameters(),
+        lr=float(cfg.lr),
+        momentum=0.9,
+        weight_decay=float(cfg.wd),
+        nesterov=True,
     )
+    crit = nn.CrossEntropyLoss(label_smoothing=float(cfg.label_smoothing))
 
-    # Loaders (DistributedSampler + MpDeviceLoader)
-    sam_tr = DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=True, drop_last=False)
-    sam_va = DistributedSampler(val_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False)
-    sam_te = DistributedSampler(test_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False)
+    # Datasets need split indices; try load checkpoint early for split recovery
+    ckpt = load_checkpoint_if_exists(ckpt_path)
+    if ckpt is not None:
+        try:
+            train_idx = ckpt.get("train_idx", None)
+            val_idx = ckpt.get("val_idx", None)
+            start_ep = int(ckpt.get("epoch", -1)) + 1
+            best_val = float(ckpt.get("best_val", -float("inf")))
+            if is_rank0:
+                log0(f"[resume] Found {ckpt_path} -> start_ep={start_ep}, best_val={best_val:.2f}")
+        except Exception as e:
+            if is_rank0:
+                log0(f"[resume] Failed to parse checkpoint meta; will ignore: {e}")
+            ckpt = None
 
-    loader_kw = dict(pin_memory=True)
-    dl_params = set(inspect.signature(DataLoader.__init__).parameters.keys())
-    if cfg.workers > 0:
-        loader_kw.update(num_workers=cfg.workers)
-        if "persistent_workers" in dl_params:
-            loader_kw.update(persistent_workers=bool(cfg.persistent_workers))
-        if "prefetch_factor" in dl_params:
-            loader_kw.update(prefetch_factor=cfg.prefetch)
-    else:
-        loader_kw.update(num_workers=0)
+    if train_idx is None or val_idx is None:
+        tr_idx, va_idx = stratified_split_indices(labels, val_frac=float(cfg.val_frac), seed=int(cfg.seed))
+        train_idx, val_idx = tr_idx, va_idx
+        if is_rank0:
+            log0(f"[split] Stratified split: train={len(train_idx)} val={len(val_idx)} (seed={cfg.seed})")
 
-    tr_cpu = DataLoader(train_ds, batch_size=cfg.bs, sampler=sam_tr, shuffle=False, drop_last=False, **loader_kw)
-    va_cpu = DataLoader(val_ds, batch_size=cfg.bs, sampler=sam_va, shuffle=False, drop_last=False, **loader_kw)
-    te_cpu = DataLoader(test_ds, batch_size=cfg.bs, sampler=sam_te, shuffle=False, drop_last=False, **loader_kw)
+    train_full = torchvision.datasets.ImageFolder(train_root, transform=tf_train)
+    eval_full = torchvision.datasets.ImageFolder(train_root, transform=tf_eval)
+
+    tr_ds = Subset(train_full, train_idx)
+    va_ds = Subset(eval_full, val_idx)
+    te_ds = torchvision.datasets.ImageFolder(val_images_root, transform=tf_eval)
+
+    sam_tr = DistributedSampler(tr_ds, num_replicas=world, rank=rank, shuffle=True, drop_last=bool(cfg.drop_last))
+    sam_va = DistributedSampler(va_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False)
+    sam_te = DistributedSampler(te_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False)
+
+    dl_kw: Dict[str, Any] = dict(
+        num_workers=int(cfg.num_workers),
+        pin_memory=bool(cfg.pin_memory),
+        drop_last=bool(cfg.drop_last),
+        worker_init_fn=_worker_init_fn(int(cfg.seed), int(rank)),
+    )
+    if int(cfg.num_workers) > 0:
+        dl_kw["persistent_workers"] = bool(cfg.persistent_workers)
+        dl_kw["prefetch_factor"] = int(cfg.prefetch_factor)
+
+    tr_collate = make_mix_collate(cfg.mix_alpha, cfg.cut_alpha, cfg.cut_prob)
+
+    tr_cpu = DataLoader(tr_ds, batch_size=int(cfg.bs), sampler=sam_tr, shuffle=False, collate_fn=tr_collate, **dl_kw)
+    va_cpu = DataLoader(va_ds, batch_size=int(cfg.bs), sampler=sam_va, shuffle=False, **dl_kw)
+    te_cpu = DataLoader(te_ds, batch_size=int(cfg.bs), sampler=sam_te, shuffle=False, **dl_kw)
 
     tr_loader = pl.MpDeviceLoader(tr_cpu, device)
-    val_loader = pl.MpDeviceLoader(va_cpu, device)
+    va_loader = pl.MpDeviceLoader(va_cpu, device)
     te_loader = pl.MpDeviceLoader(te_cpu, device)
 
-    # Master-only: params/MACs snapshot (CPU profiling for stability)
-    if xm.is_master_ordinal():
-        net_cpu = ChebResNet(
-            classes=classes,
-            K=Ktup,
-            depth=depth,
-            widths=widths,
-            drop_rate=cfg.drop_rate,
-            lap=cfg.lambda_lap,
-            realization=cfg.realization,
-            gate_mode=cfg.gate_mode,
-            stabilize_cheb=bool(cfg.stabilize_cheb),
-        ).to(torch.device("cpu"))
-        params = count_parameters(net_cpu, trainable_only=True)
-        macs = profile_macs(net_cpu, input_size=(1, 3, 64, 64), device=torch.device("cpu"))
-        flops = 2 * macs
-        mprint(f"[S0] Params: {params/1e6:.3f}M | MACs@64x64: {macs/1e9:.3f}G | FLOPs≈{flops/1e9:.3f}G")
-        write_json(
-            {
-                "params_trainable": int(params),
-                "macs_64x64": int(macs),
-                "flops_64x64": int(flops),
-                "notes": "FLOPs ≈ 2×MACs; TinyImageNet uses 64×64 inputs.",
-            },
-            os.path.join(cfg.logdir, "params_flops.json"),
-        )
+    steps_per_epoch = len(tr_cpu)
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=float(cfg.lr),
+        epochs=int(cfg.epochs),
+        steps_per_epoch=int(steps_per_epoch),
+        pct_start=float(cfg.pct_start),
+        anneal_strategy="cos",
+    )
 
-    # Hardware snapshot baseline (master-only)
-    if xm.is_master_ordinal():
-        snapshot_hardware_tpu(cfg.logdir, cfg, str(device), rank, world)
+    if ckpt is not None:
+        try:
+            net.load_state_dict(ckpt["model"], strict=True)
+            if ckpt.get("opt") is not None:
+                opt.load_state_dict(ckpt["opt"])
+            if ckpt.get("sched") is not None:
+                sched.load_state_dict(ckpt["sched"])
+            if is_rank0:
+                log0("[resume] Loaded model/opt/sched state successfully.")
+        except Exception as e:
+            if is_rank0:
+                log0(f"[resume] State load failed (will continue from scratch): {e}")
+            start_ep = 0
+            best_val = -float("inf")
 
-    # CSV for epoch efficiency (same schema, power fields empty/none)
-    eff_header = [
-        "epoch",
-        "epoch_sec",
-        "train_images",
-        "imgs_per_s_epoch",
-        "data_time_s",
-        "compute_time_s",
-        "data_frac",
-        "compute_frac",
-        "power_method",
-        "power_samples",
-        "power_missing",
-        "mean_watts",
-        "min_watts",
-        "max_watts",
-        "mean_util_gpu",
-        "mean_util_mem",
-        "mean_mem_mb",
-        "energy_joules",
-        "images_for_energy",
-        "energy_per_img_j",
-        "amp_dtype",
-        "compiled",
-        "realization",
-        "dataset",
-        "bs",
-    ]
-    eff_path = os.path.join(cfg.logdir, "epoch_efficiency.csv")
+    # Broadcast model params so all ranks start identical
+    try:
+        xm.broadcast_master_param(net)
+    except Exception:
+        pass
+
+    amp_dtype = torch.bfloat16 if int(cfg.amp) else None
 
     wall0 = time.time()
-    epoch_seconds = []
-
-    # Training loop
-    for ep in range(start_ep, cfg.epochs):
+    for ep in range(start_ep, int(cfg.epochs)):
         sam_tr.set_epoch(ep)
 
+        if is_rank0:
+            log0(f"=== Epoch {ep+1}/{int(cfg.epochs)} begin ===")
+            log0(f"[epoch] steps_per_epoch={steps_per_epoch} | bs={cfg.bs} | world={world}")
+
         t0 = time.time()
-        tr_l, tr_a, tr_data_s, tr_comp_s = train_epoch(
-            net, tr_loader, crit, opt, scaler, cfg, device, amp_dtype_train
+        tr_loss, tr_acc, _ = train_epoch_xla(
+            net,
+            tr_loader,
+            crit,
+            opt,
+            sched,
+            device=device,
+            amp_dtype=amp_dtype,
+            log0=log0,
+            log_every=int(cfg.log_steps),
         )
-        sched.step()
-
-        run_val = (ep % max(1, cfg.val_every) == 0)
-        if run_val:
-            va_l, va_a, _, _ = evaluate(net, val_loader, crit, device, amp_dtype_eval)
-        else:
-            va_l = float("nan")
-            va_a = float("nan")
-
         epoch_sec = time.time() - t0
-        epoch_seconds.append(epoch_sec)
 
-        train_images = len(train_ds)
-        imgs_per_s_epoch = (train_images / epoch_sec) if epoch_sec > 0 else float("inf")
-
-        lr_show = opt.param_groups[0]["lr"]
-
-        if xm.is_master_ordinal():
-            mprint(
-                f"Epoch {ep:03d} | Train L {tr_l:.3f} A {tr_a:.2f}% | "
-                f"Val L {va_l:.3f} A {va_a:.2f}% | LR {lr_show:.6f} | "
-                f"epoch_sec {epoch_sec:.2f}s | {imgs_per_s_epoch:.1f} img/s | "
-                f"data {tr_data_s:.2f}s ({(tr_data_s/epoch_sec)*100:.1f}%) | "
-                f"compute {tr_comp_s:.2f}s ({(tr_comp_s/epoch_sec)*100:.1f}%)"
-            )
-
-            # learning curve
-            save_learning_curve_csv(
-                cfg.logdir,
-                {
-                    "epoch": ep,
-                    "train_loss": tr_l,
-                    "train_acc": tr_a,
-                    "val_loss": va_l,
-                    "val_acc": va_a,
-                    "lr": lr_show,
-                    "epoch_seconds": epoch_sec,
-                    "wall_seconds": time.time() - wall0,
-                },
-            )
-
-            # efficiency (no power on TPU)
-            data_frac = (tr_data_s / epoch_sec) if epoch_sec > 0 else 0.0
-            comp_frac = (tr_comp_s / epoch_sec) if epoch_sec > 0 else 0.0
-
-            append_csv_row(
-                eff_path,
-                eff_header,
-                {
-                    "epoch": ep,
-                    "epoch_sec": epoch_sec,
-                    "train_images": train_images,
-                    "imgs_per_s_epoch": imgs_per_s_epoch,
-                    "data_time_s": tr_data_s,
-                    "compute_time_s": tr_comp_s,
-                    "data_frac": data_frac,
-                    "compute_frac": comp_frac,
-                    "power_method": "none",
-                    "power_samples": 0,
-                    "power_missing": 0,
-                    "mean_watts": None,
-                    "min_watts": None,
-                    "max_watts": None,
-                    "mean_util_gpu": None,
-                    "mean_util_mem": None,
-                    "mean_mem_mb": None,
-                    "energy_joules": 0.0,
-                    "images_for_energy": train_images + (len(val_ds) if run_val else 0),
-                    "energy_per_img_j": None,
-                    "amp_dtype": amp_dtype_name(amp_dtype_train),
-                    "compiled": 0,
-                    "realization": cfg.realization,
-                    "dataset": "tinyimagenet",
-                    "bs": cfg.bs,
-                },
-            )
-
-            # Save checkpoint each epoch (Option B: split in checkpoint only)
-            split_dict = pack_split_indices(train_idx, val_idx)
-
-            ckpt = {
-                "epoch": int(ep),
-                "best_val": float(best_val_acc),
-                "model": _to_cpu_obj(state_dict_uncompiled(net)),
-                "optimizer": _to_cpu_obj(opt.state_dict()),
-                "scheduler": _to_cpu_obj(sched.state_dict()),
-                "split": split_dict,
-                "rng": None,
-                "extra": {"dataset": "tinyimagenet"},
-                "format_version": 1,
-            }
-            tmp = ckpt_path + ".tmp"
-            torch.save(ckpt, tmp)
-            os.replace(tmp, ckpt_path)
-
-            # Best checkpoint on val
-            if run_val and math.isfinite(va_a) and (va_a > best_val_acc):
-                best_val_acc = float(va_a)
-                best_epoch = int(ep)
-                sd_best = _to_cpu_obj(state_dict_uncompiled(net))
-                torch.save(sd_best, best_path)
-                write_json(
-                    {
-                        "best_epoch": int(best_epoch),
-                        "best_val_acc": float(best_val_acc),
-                        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "lr_at_save": float(lr_show),
-                    },
-                    best_meta,
-                )
-                mprint(f"[best] New best Val Acc {best_val_acc:.2f}% at epoch {best_epoch} → saved {best_path}")
-
-    # Final evaluation + latency sweeps (master-only)
-    if xm.is_master_ordinal():
-        if os.path.isfile(best_path):
-            sd = torch.load(best_path, map_location="cpu")
-            load_state_dict_portable(net, sd, strict=True)
-            mprint(f"[best] Loaded best model from epoch {best_epoch} (Val Acc {best_val_acc:.2f}%)")
+        do_val = (ep % max(1, int(cfg.val_every)) == 0)
+        if do_val:
+            va_loss, va_acc = evaluate_xla(net, va_loader, crit, device=device, amp_dtype=amp_dtype)
         else:
-            mprint("[best] No best_model.pth found; evaluating current weights")
+            va_loss, va_acc = float("nan"), float("nan")
 
-        te_l, te_a, _, _ = evaluate(net, te_loader, crit, device, amp_dtype_eval)
-        mprint(f"\nFinal TINYIMAGENET Test Accuracy: {te_a:.2f}%")
-        write_json({"test_loss": te_l, "test_acc": te_a}, os.path.join(cfg.logdir, "tinyimagenet_test_metrics.json"))
-
-        # Basic latency stats on TPU (bs=1 and bs=cfg.bs)
-        lat1 = xla_latency_ms_samples(net, shape=(1, 3, 64, 64), iters=200, warmup=50, device=device)
-        latb = xla_latency_ms_samples(net, shape=(int(cfg.bs), 3, 64, 64), iters=200, warmup=50, device=device)
-        write_json(
-            {"bs1": lat1, f"bs{int(cfg.bs)}": latb},
-            os.path.join(cfg.logdir, "latency_stats.json"),
-        )
-        mprint(
-            f"[Latency/XLA] bs=1   {lat1['mean_ms']:.3f}±{lat1['std_ms']:.3f} ms "
-            f"(median {lat1['median_ms']:.3f}, p10 {lat1['p10_ms']:.3f}, p90 {lat1['p90_ms']:.3f}) "
-            f"| {lat1['imgs_per_s']:.1f} img/s"
-        )
-        mprint(
-            f"[Latency/XLA] bs={int(cfg.bs)} {latb['mean_ms']:.3f}±{latb['std_ms']:.3f} ms "
-            f"(median {latb['median_ms']:.3f}, p10 {latb['p10_ms']:.3f}, p90 {latb['p90_ms']:.3f}) "
-            f"| {latb['imgs_per_s']:.1f} img/s"
-        )
-
-        # Gate stats + order scales (best-effort on XLA)
-        try:
-            collect_gate_stats(net, val_loader, device, cfg.logdir, amp_dtype=amp_dtype_eval)
-        except Exception as e:
-            mprint(f"[gate_stats] skipped on XLA: {e}")
-        try:
-            dump_order_scales(net, cfg.logdir)
-        except Exception as e:
-            mprint(f"[order_scales] dump skipped: {e}")
-
-        # MACs breakdown (CPU, using best weights)
-        try:
-            sd_cpu = torch.load(best_path, map_location="cpu") if os.path.isfile(best_path) else _to_cpu_obj(state_dict_uncompiled(net))
-            net_cpu2 = ChebResNet(
-                classes=classes,
-                K=Ktup,
-                depth=depth,
-                widths=widths,
-                drop_rate=cfg.drop_rate,
-                lap=cfg.lambda_lap,
-                realization=cfg.realization,
-                gate_mode=cfg.gate_mode,
-                stabilize_cheb=bool(cfg.stabilize_cheb),
-            ).to(torch.device("cpu"))
-            load_state_dict_portable(net_cpu2, sd_cpu, strict=True)
-            profile_macs_breakdown(
-                _unwrap_compiled(net_cpu2),
-                input_size=(1, 3, 64, 64),
-                device=torch.device("cpu"),
-                save_csv=os.path.join(cfg.logdir, "F3_macs_breakdown.csv"),
-            )
-        except Exception as e:
-            mprint(f"[macs_breakdown] skipped: {e}")
-
-        # Latency sweep across realizations on TPU (required)
-        try:
-            sd_best_cpu = torch.load(best_path, map_location="cpu") if os.path.isfile(best_path) else _to_cpu_obj(state_dict_uncompiled(net))
-
-            model_cfg: Dict[str, object] = dict(
-                classes=classes,
-                K=Ktup,
-                depth=depth,
-                widths=widths,
-                drop_rate=cfg.drop_rate,
-                lap=cfg.lambda_lap,
-                gate_mode=cfg.gate_mode,
-                stabilize_cheb=bool(cfg.stabilize_cheb),
+        if is_rank0:
+            lr_show = opt.param_groups[0]["lr"]
+            train_images = len(tr_ds)
+            imgs_per_s = (train_images / epoch_sec) if epoch_sec > 0 else float("inf")
+            log0(
+                f"[Ep {ep:03d}] train L {tr_loss:.3f} A {tr_acc:.2f}% | "
+                f"val L {va_loss:.3f} A {va_acc:.2f}% | "
+                f"lr {lr_show:.6g} | epoch {epoch_sec:.2f}s | {imgs_per_s:.1f} img/s"
             )
 
-            realizations = ["concat", "streamed", "mstream", "gemm"]
-            bss = [1, 2, 4, 8, 16, 32]  # safe default for 64×64 on TPU
-            xla_fairness_latency_all(
-                base_state_dict_cpu=sd_best_cpu,
-                model_cfg=model_cfg,
-                realizations=realizations,
-                logdir=cfg.logdir,
-                device=device,
-                batch_sizes=bss,
-                tag="all_realizations_xla",
-            )
-            mprint("[fair_all/xla] latency sweep across realizations saved:",
-                   os.path.join(cfg.logdir, "latency_sweep_all_realizations_xla.csv"))
-        except Exception as e:
-            mprint(f"[fair_all/xla] sweep failed: {e}")
+            ckpt_obj = {
+                "epoch": int(ep),
+                "best_val": float(best_val),
+                "model": _to_cpu_obj(net.state_dict()),
+                "opt": _to_cpu_obj(opt.state_dict()),
+                "sched": _to_cpu_obj(sched.state_dict()),
+                "train_idx": _to_cpu_obj(train_idx),
+                "val_idx": _to_cpu_obj(val_idx),
+                "format_version": 1,
+                "extra": {"dataset": "tinyimagenet", "world_size": int(world)},
+                "model_cfg": {
+                    "K": list(cfg.K),
+                    "depth": list(cfg.depth),
+                    "widths": list(cfg.widths),
+                    "lambda_lap": float(cfg.lambda_lap),
+                    "realization": str(cfg.realization),
+                    "gate_mode": str(cfg.gate_mode),
+                    "stabilize_cheb": int(cfg.stabilize_cheb),
+                    "drop_rate": float(cfg.drop_rate),
+                },
+            }
+            _atomic_torch_save(ckpt_obj, ckpt_path)
 
-        # Finalize env snapshot with epoch times
-        snapshot_hardware_tpu(cfg.logdir, cfg, str(device), rank, world, epoch_seconds)
-        mprint("[E1] Hardware/env snapshot saved:", os.path.join(cfg.logdir, "hardware_env.json"))
-        mprint("\n[DONE] All metrics & artifacts saved in:", cfg.logdir)
+            if do_val and np.isfinite(va_acc) and float(va_acc) > float(best_val):
+                best_val = float(va_acc)
+                _atomic_torch_save(_to_cpu_obj(net.state_dict()), best_path)
+                log0(f"[best] New best val acc {best_val:.2f}% -> {best_path}")
+
+        xm.rendezvous(f"epoch_{ep}_done")
+
+    xm.rendezvous("train_done")
+
+    if os.path.isfile(best_path):
+        if is_rank0:
+            sd = torch.load(best_path, map_location="cpu", weights_only=False)
+            net.load_state_dict(sd, strict=True)
+            log0(f"[best] Loaded best model (best_val={best_val:.2f}%)")
+        xm.rendezvous("best_loaded")
+        try:
+            xm.broadcast_master_param(net)
+        except Exception:
+            if not is_rank0:
+                sd = torch.load(best_path, map_location="cpu", weights_only=False)
+                net.load_state_dict(sd, strict=True)
+    else:
+        xm.rendezvous("best_loaded")
+
+    @torch.no_grad()
+    def evaluate_local_xla(model, loader, crit, device, amp_dtype):
+        import torch_xla.core.xla_model as xm
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        model.eval()
+        loss_sum = 0.0
+        correct = 0
+        total = 0
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            with _safe_autocast_xla(amp_dtype):
+                out = model(xb)
+                loss = crit(out, yb)
+            bs = xb.size(0)
+            loss_sum += float(loss.item()) * bs
+            correct += int(out.argmax(1).eq(yb).sum().item())
+            total += int(bs)
+            xm.mark_step()
+        return loss_sum / max(1, total), 100.0 * correct / max(1, total)
+
+    xm.rendezvous("before_final_test")
+    
+    if is_rank0:
+        # IMPORTANT: no DistributedSampler, no MpDeviceLoader, no all_reduce
+        test_ds = torchvision.datasets.ImageFolder(val_images_root, transform=tf_eval)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=int(cfg.bs),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+        )
+        te_loss, te_acc = evaluate_local_xla(net, test_loader, crit, device, amp_dtype)
+        log0(f"\nFinal held-out (val/) -> loss {te_loss:.3f} acc {te_acc:.2f}%")
+    
+    xm.rendezvous("after_final_test")
 
 
 # ----------------------------
-# Main
+# Main / CLI
 # ----------------------------
-
 def main():
     p = argparse.ArgumentParser()
 
-    # Data / training (defaults set to your TPU TinyImageNet reference where applicable)
-    p.add_argument("--data", default="./data")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--bs", type=int, default=32)
-    p.add_argument("--lr", type=float, default=0.2)
-    p.add_argument("--auto_lr", type=int, default=1)
-    p.add_argument("--wd", type=float, default=5e-4)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--cut_alpha", type=float, default=1.0)
-    p.add_argument("--drop_rate", type=float, default=0.2)
-    p.add_argument("--amp", type=int, default=1)
-    p.add_argument("--eval_amp", type=int, default=1)
-    p.add_argument("--accum_steps", type=int, default=1)
-    p.add_argument("--clip_every", type=int, default=1)
+    p.add_argument("--data", default="/data")
+    p.add_argument("--logdir", default="/cheb_logs_tiny")
 
-    # Model knobs (same interface as CIFAR run.py)
-    p.add_argument("--widths", type=str, default="192,384,768")
-    p.add_argument("--K", type=str, default="3,5,5")
-    p.add_argument("--depth", type=str, default="7,7,7")
+    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--bs", type=int, default=16)
+    p.add_argument("--lr", type=float, default=0.2)
+    p.add_argument("--wd", type=float, default=5e-4)
+    p.add_argument("--seed", type=int, default=0)
+
+    # Model hyperparams
+    p.add_argument("--K", type=int, nargs=3, default=[3,5,5])
+    p.add_argument("--depth", type=int, nargs=3, default=[7,7,7])
+    p.add_argument("--widths", type=int, nargs=3, default=[224,448,896])
+    p.add_argument("--channels_last", type=int, default=0)
+
+    # Model-architecture knobs
     p.add_argument("--lambda_lap", type=float, default=0.25)
-    p.add_argument("--realization", type=str, default="mstream", choices=["streamed", "concat", "gemm", "mstream"])
+    p.add_argument("--realization", type=str, default="concat", choices=["streamed", "concat", "gemm", "mstream"])
     p.add_argument("--gate_mode", type=str, default="on", choices=["on", "off"])
     p.add_argument("--stabilize_cheb", type=int, default=0)
+    p.add_argument("--drop_rate", type=float, default=0.15)
 
-    # Loader (map to your existing args; no extra TPU-only knobs)
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--prefetch", type=int, default=16)
-    p.add_argument("--persistent_workers", type=int, default=1)
+    # MixUp / CutMix
+    p.add_argument("--mix_alpha", type=float, default=0.0)
+    p.add_argument("--cut_alpha", type=float, default=1.0)
+    p.add_argument("--cut_prob", type=float, default=0.5)
 
-    # Eval cadence
+    # OneCycleLR
+    p.add_argument("--pct_start", type=float, default=0.1)
+
+    # Augment knobs
+    p.add_argument("--ra_n", type=int, default=3)
+    p.add_argument("--ra_m", type=int, default=9)
+
+    # Train/eval knobs
+    p.add_argument("--label_smoothing", type=float, default=0.1)
+    p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--val_every", type=int, default=1)
+    p.add_argument("--log_steps", type=int, default=400)
 
-    # Determinism flags (kept for config parity; TPU path does not use cuDNN)
-    p.add_argument("--deterministic", type=int, default=1)
+    # DataLoader knobs
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--persistent_workers", action="store_true")
+    p.add_argument("--prefetch_factor", type=int, default=16)
+    p.add_argument("--pin_memory", type=int, default=0)
+    p.add_argument("--drop_last", action="store_true")
 
-    # Logs
-    p.add_argument("--logdir", default="./chebgate_logs_tiny")
+    # AMP (bf16)
+    p.add_argument("--amp", type=int, default=0)
+
+    # Multiprocessing
+    p.add_argument("--mp_start", type=str, default="fork", choices=["spawn", "fork"])
 
     cfg, _ = p.parse_known_args()
+    os.makedirs(cfg.logdir, exist_ok=True)
 
-    ensure_logdir(cfg.logdir)
-    write_json(vars(cfg), os.path.join(cfg.logdir, "config_args.json"))
-
-    # Ensure data is prepared once before spawning (faster first epoch)
-    ensure_tinyimagenet_ready(cfg.data)
-
-    # Clear any stray TPU env (consistent with your reference)
+    # IMPORTANT for Kaggle v5e-8 (PJRT): set before importing torch_xla in workers
     os.environ.pop("TPU_PROCESS_ADDRESSES", None)
+    os.environ.pop("CLOUD_TPU_TASK_ID", None)
+    os.environ["PJRT_DEVICE"] = "TPU"
 
-    _, _, _, xmp = _xla_imports()
-    xmp.spawn(_mp_fn, args=(cfg,), nprocs=None, start_method="fork")
+    print(f"[launch] PJRT_DEVICE={os.environ.get('PJRT_DEVICE','')} | mp_start={cfg.mp_start}", flush=True)
+    print(f"[launch] logdir={cfg.logdir}", flush=True)
+
+    import json
+    with open(os.path.join(cfg.logdir, "config_args.json"), "w") as f:
+        json.dump(vars(cfg), f, indent=2, sort_keys=True)
+
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    xmp.spawn(_mp_fn, args=(cfg,), nprocs=None, start_method=cfg.mp_start)
 
 
 if __name__ == "__main__":
